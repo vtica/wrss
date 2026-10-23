@@ -1,0 +1,1 @@
+FROM freshrss/freshrss:latest
