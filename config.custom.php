@@ -1,6 +1,6 @@
 <?php
 return array (
-  'icons_url' => 'https://www.google.com/s2/favicons?domain=%s&sz=32',
+  'icons_url' => 'https://icons.duckduckgo.com/ip3/%s.ico',
   'curl_options' => array (
     CURLOPT_CONNECTTIMEOUT => 3,
     CURLOPT_TIMEOUT => 8,
