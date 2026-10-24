@@ -1,8 +1,8 @@
 <?php
 // Handles:
-// 1. Persisting & restoring full User + System configurations (themes, custom CSS, extension configs, salt) in Aiven PostgreSQL
-// 2. Persisting & restoring the entire /data/favicons/ directory (binary .ico, .png, .svg, .webp, .jpg, .txt) in Aiven PostgreSQL
-// 3. Auto-enabling all installed extensions in /extensions/ and cleaning up removed extensions
+// 1. Persisting & restoring full User + System configurations in Aiven PostgreSQL (with strict curl_options and array sanitization)
+// 2. Persisting & restoring the entire /data/favicons/ directory in Aiven PostgreSQL
+// 3. Auto-enabling all valid installed extensions in /extensions/ and stripping invalid/corrupted keys
 
 $mode = $argv[1] ?? '--restore';
 
@@ -17,6 +17,10 @@ if (!file_exists($sysConfigFile)) {
 
 try {
     $sysConfig = include($sysConfigFile);
+    if (!is_array($sysConfig)) {
+        exit(0);
+    }
+
     $user = $sysConfig['default_user'] ?? '';
     $db = $sysConfig['db'] ?? [];
 
@@ -46,21 +50,38 @@ try {
     $stateTable = $prefix . 'persistent_state';
     $favTable = $prefix . 'persistent_favicons';
 
-    // Ensure the persistent state table exists in Aiven
     $pdo->exec("CREATE TABLE IF NOT EXISTS {$quote}{$stateTable}{$quote} (
         config_key VARCHAR(64) PRIMARY KEY,
         config_json TEXT NOT NULL,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )");
 
-    // Ensure the persistent favicons table exists in Aiven
     $pdo->exec("CREATE TABLE IF NOT EXISTS {$quote}{$favTable}{$quote} (
         filename VARCHAR(128) PRIMARY KEY,
         file_b64 TEXT NOT NULL,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )");
 
-    // Helper function to save current configs to Aiven
+    // Sanitize curl_options so invalid keys (like 0 or 1 from JSON/array re-indexing) never crash curl_setopt_array()
+    $sanitizeCurlOptions = function (&$cfg) {
+        $validCurlOpts = [
+            CURLOPT_CONNECTTIMEOUT => 3,
+            CURLOPT_TIMEOUT => 8,
+        ];
+        if (isset($cfg['curl_options']) && is_array($cfg['curl_options'])) {
+            $testCh = curl_init();
+            foreach ($cfg['curl_options'] as $k => $v) {
+                if (is_int($k) && $k > 0 && $testCh !== false && @curl_setopt($testCh, $k, $v)) {
+                    $validCurlOpts[$k] = $v;
+                }
+            }
+            if ($testCh !== false) {
+                curl_close($testCh);
+            }
+        }
+        $cfg['curl_options'] = $validCurlOpts;
+    };
+
     $saveStateToDb = function ($pdo, $quote, $stateTable, $key, $dataArray) {
         $json = json_encode($dataArray, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
         $stmt = $pdo->prepare("INSERT INTO {$quote}{$stateTable}{$quote} (config_key, config_json, updated_at)
@@ -69,7 +90,6 @@ try {
         $stmt->execute([':k' => $key, ':v' => $json]);
     };
 
-    // Helper function to save a favicon file (.ico, .png, .svg, .webp, .jpg, .gif, .txt) to Aiven
     $saveFaviconToDb = function ($pdo, $quote, $favTable, $filename, $fullPath) {
         if (!is_file($fullPath)) {
             return false;
@@ -88,7 +108,6 @@ try {
 
     // =========================================================================
     // MODE A: REAL-TIME BACKGROUND SYNC (--sync)
-    // Watches config.php files AND /data/favicons/ for any changes made in the UI
     // =========================================================================
     if ($mode === '--sync') {
         $lastSysMtime = file_exists($sysConfigFile) ? filemtime($sysConfigFile) : 0;
@@ -111,25 +130,29 @@ try {
             sleep(5);
             clearstatcache();
 
-            // 1. Sync System Config changes
             if (file_exists($sysConfigFile)) {
                 $curSysMtime = filemtime($sysConfigFile);
                 if ($curSysMtime > $lastSysMtime) {
-                    $lastSysMtime = $curSysMtime;
-                    $currentSys = include($sysConfigFile);
+                    $currentSys = @include($sysConfigFile);
                     if (is_array($currentSys)) {
+                        $sanitizeCurlOptions($currentSys);
+                        file_put_contents($sysConfigFile, "<?php\nreturn " . var_export($currentSys, true) . ";\n");
+                        @chown($sysConfigFile, 'www-data');
+                        clearstatcache();
+                        $lastSysMtime = filemtime($sysConfigFile);
                         $saveStateToDb($pdo, $quote, $stateTable, 'system_config', $currentSys);
                         echo "💾 [Sync] System configuration backed up to Aiven DB.\n";
+                    } else {
+                        $lastSysMtime = $curSysMtime;
                     }
                 }
             }
 
-            // 2. Sync User Config changes
             if (file_exists($userConfigFile)) {
                 $curUserMtime = filemtime($userConfigFile);
                 if ($curUserMtime > $lastUserMtime) {
                     $lastUserMtime = $curUserMtime;
-                    $currentUser = include($userConfigFile);
+                    $currentUser = @include($userConfigFile);
                     if (is_array($currentUser)) {
                         $saveStateToDb($pdo, $quote, $stateTable, 'user_config_' . $user, $currentUser);
                         echo "💾 [Sync] User configuration (theme/settings) backed up to Aiven DB.\n";
@@ -137,7 +160,6 @@ try {
                 }
             }
 
-            // 3. Sync new or updated Favicons in /data/favicons/
             if (is_dir($favDir)) {
                 $newFavsSynced = 0;
                 foreach (scandir($favDir) as $f) {
@@ -170,10 +192,9 @@ try {
 
     // =========================================================================
     // MODE B: BOOT-TIME RESTORE (--restore)
-    // Runs on every Render deploy before Apache starts
     // =========================================================================
 
-    // 1. Scan all currently installed extensions in /extensions/
+    // 1. Scan all currently installed extensions in /extensions/ and verify PHP syntax of extension.php
     $installedExtensions = [];
     if (is_dir($extDir)) {
         $entries = scandir($extDir);
@@ -181,17 +202,29 @@ try {
             if ($entry === '.' || $entry === '..') {
                 continue;
             }
-            $metaFile = $extDir . '/' . $entry . '/metadata.json';
-            if (file_exists($metaFile)) {
+            $extPath = $extDir . '/' . $entry;
+            $metaFile = $extPath . '/metadata.json';
+            $phpFile = $extPath . '/extension.php';
+
+            if (file_exists($metaFile) && file_exists($phpFile)) {
+                $lintOutput = [];
+                $lintExit = 0;
+                exec('php -l ' . escapeshellarg($phpFile) . ' 2>&1', $lintOutput, $lintExit);
+                if ($lintExit !== 0) {
+                    echo "⚠️ Syntax error in {$entry}/extension.php! Disabling broken extension: " . implode(' ', $lintOutput) . "\n";
+                    @rename($metaFile, $metaFile . '.broken');
+                    continue;
+                }
+
                 $meta = json_decode(file_get_contents($metaFile), true);
-                if (!empty($meta['name'])) {
+                if (is_array($meta) && !empty($meta['name']) && is_string($meta['name'])) {
                     $installedExtensions[$meta['name']] = true;
                 }
             }
         }
     }
 
-    // 2. Restore System Config from Aiven DB (including persistent salt so favicon hashes never change!)
+    // 2. Restore System Config from Aiven DB (with strict curl_options and auth_type sanitization)
     $stmtSys = $pdo->prepare("SELECT config_json FROM {$quote}{$stateTable}{$quote} WHERE config_key = :k");
     $stmtSys->execute([':k' => 'system_config']);
     $savedSysRow = $stmtSys->fetch(PDO::FETCH_ASSOC);
@@ -204,25 +237,31 @@ try {
             if (!empty($sysConfig['base_url'])) {
                 $savedSys['base_url'] = $sysConfig['base_url'];
             }
+            if (empty($savedSys['auth_type']) || !in_array($savedSys['auth_type'], ['form', 'http_auth', 'none'], true)) {
+                $savedSys['auth_type'] = 'form';
+            }
+            unset($savedSys['curl_options']);
             $sysConfig = array_replace_recursive($sysConfig, $savedSys);
-            echo "✅ Restored System config (and persistent salt) from Aiven DB.\n";
+            echo "✅ Restored System config from Aiven DB.\n";
         }
     }
 
-    if (!isset($sysConfig['extensions_enabled']) || !is_array($sysConfig['extensions_enabled'])) {
-        $sysConfig['extensions_enabled'] = [];
-    }
-    // Remove extensions from config that are no longer installed in /extensions/
-    foreach (array_keys($sysConfig['extensions_enabled']) as $extName) {
-        if (!isset($installedExtensions[$extName])) {
-            unset($sysConfig['extensions_enabled'][$extName]);
+    // Force-validate curl_options so curl_setopt_array() in httpUtil.php never receives re-indexed keys (0, 1)
+    $sanitizeCurlOptions($sysConfig);
+
+    // Rebuild extensions_enabled cleanly as strictly boolean values for valid installed extensions
+    $cleanSysExt = [];
+    foreach ($installedExtensions as $extName => $_) {
+        if (isset($sysConfig['extensions_enabled']) && is_array($sysConfig['extensions_enabled']) && array_key_exists($extName, $sysConfig['extensions_enabled'])) {
+            $cleanSysExt[$extName] = (bool)$sysConfig['extensions_enabled'][$extName];
+        } else {
+            $cleanSysExt[$extName] = true;
         }
     }
-    // Enable all installed extensions
-    foreach ($installedExtensions as $extName => $status) {
-        if (!isset($sysConfig['extensions_enabled'][$extName])) {
-            $sysConfig['extensions_enabled'][$extName] = true;
-        }
+    $sysConfig['extensions_enabled'] = $cleanSysExt;
+
+    if (!isset($sysConfig['extensions']) || !is_array($sysConfig['extensions'])) {
+        $sysConfig['extensions'] = [];
     }
 
     file_put_contents($sysConfigFile, "<?php\nreturn " . var_export($sysConfig, true) . ";\n");
@@ -232,6 +271,9 @@ try {
     // 3. Restore User Config from Aiven DB
     if (file_exists($userConfigFile)) {
         $userConfig = include($userConfigFile);
+        if (!is_array($userConfig)) {
+            $userConfig = [];
+        }
         $envPasswordHash = $userConfig['passwordHash'] ?? '';
 
         $stmtUser = $pdo->prepare("SELECT config_json FROM {$quote}{$stateTable}{$quote} WHERE config_key = :k");
@@ -249,18 +291,18 @@ try {
             }
         }
 
-        if (!isset($userConfig['extensions_enabled']) || !is_array($userConfig['extensions_enabled'])) {
-            $userConfig['extensions_enabled'] = [];
-        }
-        foreach (array_keys($userConfig['extensions_enabled']) as $extName) {
-            if (!isset($installedExtensions[$extName])) {
-                unset($userConfig['extensions_enabled'][$extName]);
+        $cleanUserExt = [];
+        foreach ($installedExtensions as $extName => $_) {
+            if (isset($userConfig['extensions_enabled']) && is_array($userConfig['extensions_enabled']) && array_key_exists($extName, $userConfig['extensions_enabled'])) {
+                $cleanUserExt[$extName] = (bool)$userConfig['extensions_enabled'][$extName];
+            } else {
+                $cleanUserExt[$extName] = true;
             }
         }
-        foreach ($installedExtensions as $extName => $status) {
-            if (!isset($userConfig['extensions_enabled'][$extName])) {
-                $userConfig['extensions_enabled'][$extName] = true;
-            }
+        $userConfig['extensions_enabled'] = $cleanUserExt;
+
+        if (!isset($userConfig['extensions']) || !is_array($userConfig['extensions'])) {
+            $userConfig['extensions'] = [];
         }
 
         file_put_contents($userConfigFile, "<?php\nreturn " . var_export($userConfig, true) . ";\n");
@@ -302,7 +344,6 @@ try {
             continue;
         }
 
-        // Exact FreshRSS Feed::customFaviconId() formula: hash('crc32b', $salt . $this->id())
         $hash = hash('crc32b', $salt . $feedId);
         $txtFile = $favDir . $hash . '.txt';
 
@@ -312,7 +353,6 @@ try {
             $saveFaviconToDb($pdo, $quote, $favTable, $hash . '.txt', $txtFile);
         }
 
-        // Check if any image file (.ico, .png, .svg, .webp, .jpg, .gif) already exists for this feed hash
         $existingIcons = glob($favDir . $hash . '.{ico,png,svg,webp,jpg,jpeg,gif}', GLOB_BRACE);
         if (empty($existingIcons)) {
             $feedHost = parse_url($website, PHP_URL_HOST);
@@ -337,7 +377,6 @@ try {
         }
     }
 
-    // Also back up any icons that actualize-user.php created during entrypoint boot
     foreach (scandir($favDir) as $f) {
         if ($f === '.' || $f === '..' || $f === 'index.html') {
             continue;
