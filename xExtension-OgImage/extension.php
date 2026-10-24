@@ -17,7 +17,7 @@ class OgImageExtension extends Minz_Extension {
 
         $content = (string)$entry->content();
 
-        // Fetch up to 512KB of the webpage HTML with full browser headers to bypass WAF blocks on sites like Politico
+        // Fetch up to 512KB of the webpage HTML with full browser headers
         $ch = curl_init($link);
         if ($ch === false) {
             return $entry;
@@ -56,31 +56,95 @@ class OgImageExtension extends Minz_Extension {
             return $entry;
         }
 
-        // Upgrade thumbnail resolution parameters for known CDNs (e.g. CNBC, Politico, WordPress)
+        // Upgrade thumbnail resolution parameters for known CDNs (CNBC, Politico, Quartz/Kinja, WordPress)
         $heroImage = $this->optimizeImageQuality($heroImage);
 
-        // Set the native FreshRSS entry thumbnail
+        // Set the native FreshRSS entry thumbnail to the single high-quality image
         if (method_exists($entry, '_thumbnail')) {
             $entry->_thumbnail([
                 'url' => $heroImage,
             ]);
         }
 
-        // Prepend the <img> tag only if the article content does not already contain this image URL
-        if (strpos($content, $heroImage) === false) {
-            $escapedUrl = htmlspecialchars($heroImage, ENT_QUOTES, 'UTF-8');
-            $heroHtml = '<figure class="freshrss-og-image"><img src="' . $escapedUrl . '" alt="" loading="lazy" style="max-width:100%;height:auto;display:block;margin-bottom:1em;border-radius:6px;" /></figure>';
-            $entry->_content($heroHtml . "\n" . $content);
-        }
+        // Remove any low-quality lead thumbnail or duplicate lazy-load placeholder already sitting at the top of the RSS content
+        $cleanContent = $this->deduplicateLeadImages($content, $heroImage);
+
+        $escapedUrl = htmlspecialchars($heroImage, ENT_QUOTES, 'UTF-8');
+        $heroHtml = '<figure class="freshrss-og-image"><img src="' . $escapedUrl . '" alt="" loading="lazy" style="max-width:100%;height:auto;display:block;margin-bottom:1em;border-radius:6px;" /></figure>';
+        $entry->_content($heroHtml . "\n" . $cleanContent);
 
         return $entry;
+    }
+
+    /**
+     * Strips leading low-res RSS thumbnails and duplicate lazy-load placeholder images
+     * so only the single high-res hero image appears at the top of the article.
+     */
+    private function deduplicateLeadImages(string $content, string $heroImage): string {
+        if (empty($content)) {
+            return '';
+        }
+
+        // 1. Remove any previous freshrss-og-image wrapper if reloading an already processed article
+        $content = preg_replace('/<figure\s+class=["\']freshrss-og-image["\'][^>]*>.*?<\/figure>\s*/is', '', $content);
+
+        // 2. Unwrap <noscript> tags around images so real images inside <noscript> aren't lost when stripping placeholders
+        $content = preg_replace('/<noscript>\s*(<(?:img|picture|figure)\b.*?)\s*<\/noscript>/is', '$1', $content);
+
+        // 3. Remove tiny blurred lazy-load placeholder <img> tags (e.g. Kinja/Quartz w_30, e_blur, data:image, or 1x1)
+        $content = preg_replace('/<img[^>]+?\bsrc=["\'](?:data:image\/[^"\']+|[^"\']*?(?:w_30|w=30|e_blur|blur=|1x1|placeholder)[^"\']*?)["\'][^>]*>/i', '', $content);
+
+        // 4. If the very beginning of the RSS feed content starts with a lead <figure>, <picture>, or single <img> wrapper,
+        // strip that initial lead image block because we are replacing it with our high-res $heroImage at the top.
+        $leadPatterns = [
+            // Leading <figure>...</figure> or <picture>...</picture> at the very start of the RSS item
+            '/^\s*(?:<(?:div|p)\b[^>]*>\s*)*<(?:figure|picture)\b[^>]*>.*?<\/(?:figure|picture)>\s*(?:<\/(?:div|p)>\s*)*/is',
+            // Leading standalone <img> (or <a><img/></a>) inside an optional <p> or <div> at the very start of the RSS item
+            '/^\s*<(?:p|div)\b[^>]*>\s*(?:<a\b[^>]*>\s*)?<img\b[^>]*>\s*(?:<\/a>\s*)?<\/(?:p|div)>\s*/is',
+            // Bare leading <img> or <a><img/></a> at the very start of the RSS item
+            '/^\s*(?:<a\b[^>]*>\s*)?<img\b[^>]*>\s*(?:<\/a>\s*)?(?:<br\s*\/?>\s*)*/is',
+        ];
+
+        foreach ($leadPatterns as $pattern) {
+            if (preg_match($pattern, $content)) {
+                $content = preg_replace($pattern, '', $content, 1);
+                break;
+            }
+        }
+
+        // 5. Also check if another <img> with the exact same asset filename/ID still exists right at the top and remove it
+        $heroKey = $this->extractImageIdentityKey($heroImage);
+        if (!empty($heroKey)) {
+            $quotedKey = preg_quote($heroKey, '/');
+            $content = preg_replace('/<figure\b[^>]*>[^<]*<img[^>]+src=["\'][^"\']*' . $quotedKey . '[^"\']*["\'][^>]*>.*?<\/figure>/is', '', $content, 1);
+            $content = preg_replace('/<img[^>]+src=["\'][^"\']*' . $quotedKey . '[^"\']*["\'][^>]*>/i', '', $content, 1);
+        }
+
+        return trim($content);
+    }
+
+    /**
+     * Extracts a unique media identifier or base filename so differently-sized CDN URLs
+     * of the same photo (e.g. w_320 vs w_1200) are recognized as the same image.
+     */
+    private function extractImageIdentityKey(string $url): string {
+        // Kinja / Quartz / G/O Media 20-char alphanumeric image IDs
+        if (preg_match('/\/([a-z0-9]{18,22})\.(?:jpg|jpeg|png|webp|gif)/i', $url, $m)) {
+            return $m[1];
+        }
+        $path = (string)parse_url($url, PHP_URL_PATH);
+        $base = basename($path);
+        // Strip common WordPress/CDN dimension suffixes like -300x200.jpg -> .jpg
+        $base = preg_replace('/-\d+x\d+(?=\.[a-z]{3,4}$)/i', '', $base);
+        if (!empty($base) && strlen($base) >= 8 && !in_array(strtolower($base), ['image.jpg', 'default.jpg', 'thumb.jpg', 'index.jpg'], true)) {
+            return $base;
+        }
+        return '';
     }
 
     private function extractBestImage(string $html, string $baseUrl): string {
         $isGalleryUrl = (bool)preg_match('#(/gallery/|/slideshow/|/photos/|[?&]slide=\d+)#i', $baseUrl);
 
-        // For explicit gallery/slide URLs (like Politico's ?slide=0), check if we can grab the exact first slide image
-        // before falling back to a potentially generic site-wide og:image banner.
         if ($isGalleryUrl) {
             $gallerySlideImage = $this->extractGalleryOrLeadBodyImage($html, $baseUrl);
             if (!empty($gallerySlideImage)) {
@@ -150,13 +214,11 @@ class OgImageExtension extends Minz_Extension {
     }
 
     private function extractGalleryOrLeadBodyImage(string $html, string $baseUrl): string {
-        // Strip <header>, <nav>, <footer>, and <aside> blocks first so we don't inspect navbar/sidebar images
         $cleanHtml = preg_replace('/<(header|nav|footer|aside)\b[^>]*>.*?<\/\1>/is', '', $html);
         if (!is_string($cleanHtml) || empty($cleanHtml)) {
             $cleanHtml = $html;
         }
 
-        // Priority A: Look inside <figure> or <picture> blocks (used by Politico galleries and modern editorial sites)
         if (preg_match_all('/<(?:figure|picture)\b[^>]*>(.*?)<\/(?:figure|picture)>/is', $cleanHtml, $figureMatches)) {
             foreach ($figureMatches[1] as $block) {
                 $candidate = $this->extractUrlFromMediaBlock($block);
@@ -169,7 +231,6 @@ class OgImageExtension extends Minz_Extension {
             }
         }
 
-        // Priority B: Look for explicit gallery/carousel or lazy-loaded lead <img> tags
         $imgUrl = $this->extractUrlFromMediaBlock($cleanHtml);
         if (!empty($imgUrl)) {
             $resolvedUrl = null;
@@ -182,7 +243,6 @@ class OgImageExtension extends Minz_Extension {
     }
 
     private function extractUrlFromMediaBlock(string $block): string {
-        // 1. Check <source srcset="..."> or <img srcset="..."> and pick the largest URL in the srcset
         if (preg_match_all('/\b(?:data-)?srcset=["\']([^"\']+)["\']/i', $block, $srcsetMatches)) {
             foreach ($srcsetMatches[1] as $srcset) {
                 $bestFromSrcset = $this->pickBestFromSrcset($srcset);
@@ -192,12 +252,11 @@ class OgImageExtension extends Minz_Extension {
             }
         }
 
-        // 2. Check lazy-load and standard img attributes (data-lazy-img is used by Politico)
         $attrPattern = '/<img[^>]+?\b(?:data-lazy-img|data-src|data-original|data-lazy-src|src)=["\']([^"\']+)["\']/i';
         if (preg_match_all($attrPattern, $block, $imgMatches)) {
             foreach ($imgMatches[1] as $rawUrl) {
                 $candidate = html_entity_decode(trim($rawUrl), ENT_QUOTES | ENT_HTML5, 'UTF-8');
-                if (!empty($candidate) && strpos($candidate, 'data:') !== 0) {
+                if (!empty($candidate) && strpos($candidate, 'data:') !== 0 && !preg_match('/(w_30|w=30|e_blur|1x1)/i', $candidate)) {
                     return $candidate;
                 }
             }
@@ -273,10 +332,15 @@ class OgImageExtension extends Minz_Extension {
             $url = preg_replace('/([?&])w=\d+/i', '$1w=1920', $url);
             $url = preg_replace('/([?&])h=\d+/i', '$1h=1080', $url);
         }
-        // Upgrade Politico Brightspot CDN resize parameters if present
+        // Upgrade Politico Brightspot CDN resize parameters
         if (strpos($url, 'politico.com') !== false) {
             $url = preg_replace('/\/resize\/\d+x\d+\//i', '/resize/1160x/', $url);
             $url = preg_replace('/([?&])w=\d+/i', '$1w=1160', $url);
+        }
+        // Upgrade Quartz / Kinja (i.kinja-img.com) Cloudinary transformation parameters to w_1200 and remove blur
+        if (strpos($url, 'kinja-img.com') !== false || strpos($url, 'qz.com') !== false) {
+            $url = preg_replace('/\bw_\d+\b/i', 'w_1200', $url);
+            $url = preg_replace('/,?\be_blur:\d+\b/i', '', $url);
         }
         return $url;
     }
@@ -286,7 +350,6 @@ class OgImageExtension extends Minz_Extension {
             return false;
         }
 
-        // Resolve protocol-relative and root-relative URLs
         if (strpos($url, '//') === 0) {
             $url = 'https:' . $url;
         } elseif (strpos($url, '/') === 0) {
@@ -296,12 +359,11 @@ class OgImageExtension extends Minz_Extension {
             }
         }
 
-        // Reject favicons, SVGs, avatars, default placeholder logos, or tracking pixel filenames
         $lower = strtolower($url);
         if (preg_match('/\.(ico|svg|mp4|m3u8|webm)(\?|$)/i', $lower)) {
             return false;
         }
-        if (preg_match('/(favicon|apple-touch-icon|avatar|author-thumb|sprite|pixel|1x1|blank\.gif|logo-icon|badge|cnbc-logo|politico-logo|default-promo|default-social|og-default|placeholder)/i', $lower)) {
+        if (preg_match('/(favicon|apple-touch-icon|avatar|author-thumb|sprite|pixel|1x1|blank\.gif|logo-icon|badge|cnbc-logo|politico-logo|default-promo|default-social|og-default|placeholder|w_30|e_blur)/i', $lower)) {
             return false;
         }
 
