@@ -76,11 +76,6 @@ class OgImageExtension extends Minz_Extension {
         return $entry;
     }
 
-    /**
-     * Strips leading low-res RSS thumbnails, duplicate lazy-load placeholder images,
-     * and multi-image RSS gallery dumps (such as E! Online's embedded slideshows)
-     * so only the single high-res hero image appears at the top of the article.
-     */
     private function deduplicateLeadImages(string $content, string $heroImage, string $articleUrl = ''): string {
         if (empty($content)) {
             return '';
@@ -102,12 +97,9 @@ class OgImageExtension extends Minz_Extension {
         $isGallerySpamSite = (strpos($articleUrl, 'eonline.com') !== false);
 
         if ($isGallerySpamSite || $imgCount >= 4) {
-            // Strip <figure> and <picture> blocks completely
             $content = preg_replace('/<(?:figure|picture)\b[^>]*>.*?<\/(?:figure|picture)>/is', '', $content);
-            // Strip standalone <img> tags (and any wrapping <a> that only wrapped the image)
             $content = preg_replace('/<a\b[^>]*>\s*<img\b[^>]*>\s*<\/a>/is', '', $content);
             $content = preg_replace('/<img\b[^>]*>/i', '', $content);
-            // Clean up empty <p> or <div> tags left behind by removed gallery images
             $content = preg_replace('/<(?:p|div)\b[^>]*>\s*(?:&nbsp;|\s|<br\s*\/?>)*<\/(?:p|div)>/is', '', $content);
             return trim($content);
         }
@@ -119,7 +111,7 @@ class OgImageExtension extends Minz_Extension {
             '/^\s*(?:<a\b[^>]*>\s*)?<img\b[^>]*>\s*(?:<\/a>\s*)?(?:<br\s*\/?>\s*)*/is',
         ];
 
-        $ strippedAny = true;
+        $strippedAny = true;
         while ($strippedAny) {
             $strippedAny = false;
             foreach ($leadPatterns as $pattern) {
@@ -142,10 +134,6 @@ class OgImageExtension extends Minz_Extension {
         return trim($content);
     }
 
-    /**
-     * Extracts a unique media identifier or base filename so differently-sized CDN URLs
-     * of the same photo (e.g. w_320 vs w_1200) are recognized as the same image.
-     */
     private function extractImageIdentityKey(string $url): string {
         if (preg_match('/\/([a-z0-9]{18,22})\.(?:jpg|jpeg|png|webp|gif)/i', $url, $m)) {
             return $m[1];
