@@ -23,7 +23,15 @@ if (!is_dir($favDir)) {
 
 try {
     $dbType = $db['type'] ?? 'pgsql';
-    $dsn = "{$dbType}:host={$db['host']};dbname={$db['base']}";
+    $rawHost = $db['host'];
+    $host = $rawHost;
+    $port = '';
+
+    if (strpos($rawHost, ':') !== false) {
+        list($host, $port) = explode(':', $rawHost, 2);
+    }
+
+    $dsn = "{$dbType}:host={$host};" . ($port !== '' ? "port={$port};" : "") . "dbname={$db['base']}";
     $pdo = new PDO($dsn, $db['user'], $db['password'], [
         PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION
     ]);
@@ -31,6 +39,7 @@ try {
     $quote = ($dbType === 'mysql') ? '`' : '"';
     $stmt = $pdo->query("SELECT id, website, url FROM {$quote}{$table}{$quote}");
 
+    $restoredCount = 0;
     while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
         $salt = hash('crc32b', $user . $row['id']);
         $txtFile = $favDir . $salt . '.txt';
@@ -43,9 +52,9 @@ try {
         }
 
         if (!empty($website) && !file_exists($icoFile)) {
-            $host = parse_url($website, PHP_URL_HOST);
-            if ($host) {
-                $ddgUrl = "https://icons.duckduckgo.com/ip3/{$host}.ico";
+            $feedHost = parse_url($website, PHP_URL_HOST);
+            if ($feedHost) {
+                $ddgUrl = "https://icons.duckduckgo.com/ip3/{$feedHost}.ico";
                 $ctx = stream_context_create([
                     'http' => [
                         'timeout' => 3,
@@ -56,11 +65,12 @@ try {
                 if ($icoData !== false && strlen($icoData) > 0) {
                     file_put_contents($icoFile, $icoData);
                     @chown($icoFile, 'www-data');
+                    $restoredCount++;
                 }
             }
         }
     }
-    echo "✅ Favicons restored.\n";
+    echo "✅ Favicons restored ({$restoredCount} icons fetched).\n";
 } catch (Exception $e) {
     echo "⚠️ Favicon restore skipped: " . $e->getMessage() . "\n";
 }
