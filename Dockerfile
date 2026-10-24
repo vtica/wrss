@@ -22,6 +22,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ca-certific
 COPY xExtension-OgImage /var/www/FreshRSS/extensions/xExtension-OgImage
 RUN chown -R www-data:www-data /var/www/FreshRSS/extensions/
 
+# Copy public keep-alive & background actualizer endpoint into FreshRSS public root (/p/)
+COPY ping.php /var/www/FreshRSS/p/ping.php
+RUN chown www-data:www-data /var/www/FreshRSS/p/ping.php
+
 # Pre-seed system and user configurations
 COPY config.custom.php /var/www/FreshRSS/data/config.custom.php
 COPY config.default.php /var/www/FreshRSS/data/users/_/config.default.php
