@@ -1,24 +1,24 @@
 <?php
-// Runs after do-install.php and create-user.php:
 // 1. Reads metadata.json from all installed extensions in /extensions/ and enables them in both system & user config.php
-// 2. Uses FreshRSS's native FeedDAO and faviconPrepare() to restore all feed favicons
+// 2. Restores all feed favicons using FreshRSS's exact hash formula: hash('crc32b', $salt . $feed_url)
 
-require_once('/var/www/FreshRSS/constants.php');
-require_once(LIB_PATH . '/lib_rss.php');
+$dataPath = '/var/www/FreshRSS/data';
+$extDir = '/var/www/FreshRSS/extensions';
+$favDir = $dataPath . '/favicons/';
+$sysConfigFile = $dataPath . '/config.php';
 
-$sysConfigFile = DATA_PATH . '/config.php';
 if (!file_exists($sysConfigFile)) {
     exit(0);
 }
 
 try {
-    // --- PART 1: AUTO-ENABLE ALL INSTALLED EXTENSIONS ---
     $sysConfig = include($sysConfigFile);
     $user = $sysConfig['default_user'] ?? '';
+    $salt = $sysConfig['salt'] ?? '';
+    $db = $sysConfig['db'] ?? [];
 
-    $extDir = EXTENSIONS_PATH;
+    // --- PART 1: AUTO-ENABLE ALL INSTALLED EXTENSIONS ---
     $enabledExtensions = [];
-
     if (is_dir($extDir)) {
         $entries = scandir($extDir);
         foreach ($entries as $entry) {
@@ -36,7 +36,6 @@ try {
     }
 
     if (!empty($enabledExtensions)) {
-        // 1A. Write enabled extensions to System config.php
         if (!isset($sysConfig['extensions_enabled']) || !is_array($sysConfig['extensions_enabled'])) {
             $sysConfig['extensions_enabled'] = [];
         }
@@ -47,9 +46,8 @@ try {
         file_put_contents($sysConfigFile, $sysContent);
         @chown($sysConfigFile, 'www-data');
 
-        // 1B. Write enabled extensions to User config.php
         if (!empty($user)) {
-            $userConfigFile = USERS_PATH . '/' . $user . '/config.php';
+            $userConfigFile = $dataPath . '/users/' . $user . '/config.php';
             if (file_exists($userConfigFile)) {
                 $userConfig = include($userConfigFile);
                 if (!isset($userConfig['extensions_enabled']) || !is_array($userConfig['extensions_enabled'])) {
@@ -67,28 +65,53 @@ try {
     }
 
     // --- PART 2: RESTORE FAVICONS ---
-    if (empty($user)) {
+    if (empty($user) || empty($db['host']) || empty($db['base'])) {
         exit(0);
     }
 
-    FreshRSS_Context::initSystem(true);
-    FreshRSS_Context::initUser($user);
-    if (FreshRSS_Context::$user_conf === null) {
-        exit(0);
+    if (!is_dir($favDir)) {
+        mkdir($favDir, 0775, true);
     }
 
-    $feedDao = FreshRSS_Factory::createFeedDao($user);
-    $feeds = $feedDao->listFeeds();
+    $dbType = $db['type'] ?? 'pgsql';
+    $rawHost = $db['host'];
+    $host = $rawHost;
+    $port = '';
+
+    if (strpos($rawHost, ':') !== false) {
+        list($host, $port) = explode(':', $rawHost, 2);
+    }
+
+    $dsn = "{$dbType}:host={$host};" . ($port !== '' ? "port={$port};" : "") . "dbname={$db['base']}";
+    $pdo = new PDO($dsn, $db['user'], $db['password'], [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION
+    ]);
+
+    $prefix = $db['prefix'] ?? '';
+    $table = $prefix . $user . '_feed';
+    $quote = ($dbType === 'mysql') ? '`' : '"';
+
+    $stmt = $pdo->query("SELECT id, url, website FROM {$quote}{$table}{$quote}");
 
     $restoredCount = 0;
-    foreach ($feeds as $feed) {
-        $feed->faviconPrepare();
-        $hash = method_exists($feed, 'hashFavicon') ? $feed->hashFavicon() : $feed->hash();
-        $icoFile = FAVICONS_DIR . $hash . '.ico';
-        $txtFile = FAVICONS_DIR . $hash . '.txt';
+    while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        $feedUrl = $row['url'] ?? '';
+        $website = !empty($row['website']) ? $row['website'] : $feedUrl;
+        if (empty($feedUrl) || empty($website)) {
+            continue;
+        }
 
-        if (!file_exists($icoFile) && file_exists($txtFile)) {
-            $website = trim(@file_get_contents($txtFile));
+        // Exact FreshRSS Feed::hashFavicon() formula: hash('crc32b', $salt . $this->url)
+        $hash = hash('crc32b', $salt . $feedUrl);
+        $txtFile = $favDir . $hash . '.txt';
+        $icoFile = $favDir . $hash . '.ico';
+
+        if (!file_exists($txtFile)) {
+            file_put_contents($txtFile, $website);
+            @chown($txtFile, 'www-data');
+        }
+
+        if (!file_exists($icoFile)) {
             $feedHost = parse_url($website, PHP_URL_HOST);
             if ($feedHost) {
                 $ddgUrl = "https://icons.duckduckgo.com/ip3/{$feedHost}.ico";
@@ -107,9 +130,8 @@ try {
                 }
             }
         }
-        @chown($txtFile, 'www-data');
     }
-    echo "✅ Favicons restored natively ({$restoredCount} icons fetched).\n";
+    echo "✅ Favicons restored ({$restoredCount} icons fetched).\n";
 } catch (Throwable $e) {
     echo "⚠️ Post-boot restore error: " . $e->getMessage() . "\n";
 }
