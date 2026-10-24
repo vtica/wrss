@@ -1,11 +1,10 @@
 FROM freshrss/freshrss:latest
 
-# Install git and clone all 6 extensions into /var/www/FreshRSS/extensions/
+# Install git and clone extensions into /var/www/FreshRSS/extensions/
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
     && mkdir -p /var/www/FreshRSS/extensions \
     && git clone --depth 1 https://github.com/FreshRSS/Extensions.git /tmp/official-ext \
     && cp -a /tmp/official-ext/xExtension-YouTube /var/www/FreshRSS/extensions/ \
-    && git clone --depth 1 https://github.com/Niehztog/freshrss-af-readability.git /var/www/FreshRSS/extensions/xExtension-af_readability \
     && git clone --depth 1 https://github.com/Eisa01/FreshRSS---Auto-Refresh-Extension.git /tmp/autorefresh \
     && if [ -d "/tmp/autorefresh/xExtension-AutoRefresh" ]; then \
          cp -a /tmp/autorefresh/xExtension-AutoRefresh /var/www/FreshRSS/extensions/; \
@@ -17,8 +16,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ca-certific
     && git clone --depth 1 https://github.com/featurecreep-cron/freshrss-extensions.git /tmp/extension-manager \
     && cp -a /tmp/extension-manager/xExtension-ExtensionManager /var/www/FreshRSS/extensions/ \
     && git clone --depth 1 https://github.com/bowencool/xExtension-BroadIconFetcher.git /var/www/FreshRSS/extensions/xExtension-BroadIconFetcher \
-    && chown -R www-data:www-data /var/www/FreshRSS/extensions/ \
     && rm -rf /tmp/official-ext /tmp/autorefresh /tmp/greader-redate /tmp/extension-manager /var/lib/apt/lists/*
+
+# Copy custom OG Image Injector extension and set ownership
+COPY xExtension-OgImage /var/www/FreshRSS/extensions/xExtension-OgImage
+RUN chown -R www-data:www-data /var/www/FreshRSS/extensions/
 
 # Pre-seed system and user configurations
 COPY config.custom.php /var/www/FreshRSS/data/config.custom.php
