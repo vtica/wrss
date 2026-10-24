@@ -1,0 +1,8 @@
+{
+  "name": "OG Image Injector",
+  "author": "vtica",
+  "description": "Extracts og:image / twitter:image from article meta tags and injects it as the hero image and thumbnail without breaking feed formatting.",
+  "version": "1.0.0",
+  "entrypoint": "OgImage",
+  "type": "user"
+}
