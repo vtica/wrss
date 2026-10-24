@@ -1,6 +1,5 @@
 <?php
 $customConfig = array (
-  'auth_type' => 'form',
   'curl_options' => array (
     CURLOPT_CONNECTTIMEOUT => 3,
     CURLOPT_TIMEOUT => 8,
