@@ -56,7 +56,7 @@ class OgImageExtension extends Minz_Extension {
             return $entry;
         }
 
-        // Upgrade thumbnail resolution parameters for known CDNs (CNBC, Politico, Quartz/Kinja, WordPress)
+        // Upgrade thumbnail resolution parameters for known CDNs (CNBC, Politico, Quartz/Kinja, E! Online)
         $heroImage = $this->optimizeImageQuality($heroImage);
 
         // Set the native FreshRSS entry thumbnail to the single high-quality image
@@ -66,8 +66,8 @@ class OgImageExtension extends Minz_Extension {
             ]);
         }
 
-        // Remove any low-quality lead thumbnail or duplicate lazy-load placeholder already sitting at the top of the RSS content
-        $cleanContent = $this->deduplicateLeadImages($content, $heroImage);
+        // Remove low-quality lead thumbnails, duplicate lazy-load placeholders, and multi-image RSS gallery dumps
+        $cleanContent = $this->deduplicateLeadImages($content, $heroImage, $link);
 
         $escapedUrl = htmlspecialchars($heroImage, ENT_QUOTES, 'UTF-8');
         $heroHtml = '<figure class="freshrss-og-image"><img src="' . $escapedUrl . '" alt="" loading="lazy" style="max-width:100%;height:auto;display:block;margin-bottom:1em;border-radius:6px;" /></figure>';
@@ -77,10 +77,11 @@ class OgImageExtension extends Minz_Extension {
     }
 
     /**
-     * Strips leading low-res RSS thumbnails and duplicate lazy-load placeholder images
+     * Strips leading low-res RSS thumbnails, duplicate lazy-load placeholder images,
+     * and multi-image RSS gallery dumps (such as E! Online's embedded slideshows)
      * so only the single high-res hero image appears at the top of the article.
      */
-    private function deduplicateLeadImages(string $content, string $heroImage): string {
+    private function deduplicateLeadImages(string $content, string $heroImage, string $articleUrl = ''): string {
         if (empty($content)) {
             return '';
         }
@@ -94,30 +95,48 @@ class OgImageExtension extends Minz_Extension {
         // 3. Remove tiny blurred lazy-load placeholder <img> tags (e.g. Kinja/Quartz w_30, e_blur, data:image, or 1x1)
         $content = preg_replace('/<img[^>]+?\bsrc=["\'](?:data:image\/[^"\']+|[^"\']*?(?:w_30|w=30|e_blur|blur=|1x1|placeholder)[^"\']*?)["\'][^>]*>/i', '', $content);
 
-        // 4. If the very beginning of the RSS feed content starts with a lead <figure>, <picture>, or single <img> wrapper,
-        // strip that initial lead image block because we are replacing it with our high-res $heroImage at the top.
+        // 4. If the feed item is from a site that dumps entire photo galleries into the RSS body (like eonline.com)
+        // or if the RSS item contains a flood of 4+ images, strip all embedded RSS images/figures so only the clean text
+        // and our single top OG hero image remain.
+        $imgCount = preg_match_all('/<img\b[^>]*>/i', $content);
+        $isGallerySpamSite = (strpos($articleUrl, 'eonline.com') !== false);
+
+        if ($isGallerySpamSite || $imgCount >= 4) {
+            // Strip <figure> and <picture> blocks completely
+            $content = preg_replace('/<(?:figure|picture)\b[^>]*>.*?<\/(?:figure|picture)>/is', '', $content);
+            // Strip standalone <img> tags (and any wrapping <a> that only wrapped the image)
+            $content = preg_replace('/<a\b[^>]*>\s*<img\b[^>]*>\s*<\/a>/is', '', $content);
+            $content = preg_replace('/<img\b[^>]*>/i', '', $content);
+            // Clean up empty <p> or <div> tags left behind by removed gallery images
+            $content = preg_replace('/<(?:p|div)\b[^>]*>\s*(?:&nbsp;|\s|<br\s*\/?>)*<\/(?:p|div)>/is', '', $content);
+            return trim($content);
+        }
+
+        // 5. For normal articles (1-3 images), strip all consecutive leading <figure>, <picture>, or <img> blocks at the start
         $leadPatterns = [
-            // Leading <figure>...</figure> or <picture>...</picture> at the very start of the RSS item
             '/^\s*(?:<(?:div|p)\b[^>]*>\s*)*<(?:figure|picture)\b[^>]*>.*?<\/(?:figure|picture)>\s*(?:<\/(?:div|p)>\s*)*/is',
-            // Leading standalone <img> (or <a><img/></a>) inside an optional <p> or <div> at the very start of the RSS item
             '/^\s*<(?:p|div)\b[^>]*>\s*(?:<a\b[^>]*>\s*)?<img\b[^>]*>\s*(?:<\/a>\s*)?<\/(?:p|div)>\s*/is',
-            // Bare leading <img> or <a><img/></a> at the very start of the RSS item
             '/^\s*(?:<a\b[^>]*>\s*)?<img\b[^>]*>\s*(?:<\/a>\s*)?(?:<br\s*\/?>\s*)*/is',
         ];
 
-        foreach ($leadPatterns as $pattern) {
-            if (preg_match($pattern, $content)) {
-                $content = preg_replace($pattern, '', $content, 1);
-                break;
+        $ strippedAny = true;
+        while ($strippedAny) {
+            $strippedAny = false;
+            foreach ($leadPatterns as $pattern) {
+                if (preg_match($pattern, $content)) {
+                    $content = preg_replace($pattern, '', $content, 1);
+                    $strippedAny = true;
+                    break;
+                }
             }
         }
 
-        // 5. Also check if another <img> with the exact same asset filename/ID still exists right at the top and remove it
+        // 6. Also check if another <img> with the exact same asset filename/ID still exists in the content and remove it
         $heroKey = $this->extractImageIdentityKey($heroImage);
         if (!empty($heroKey)) {
             $quotedKey = preg_quote($heroKey, '/');
-            $content = preg_replace('/<figure\b[^>]*>[^<]*<img[^>]+src=["\'][^"\']*' . $quotedKey . '[^"\']*["\'][^>]*>.*?<\/figure>/is', '', $content, 1);
-            $content = preg_replace('/<img[^>]+src=["\'][^"\']*' . $quotedKey . '[^"\']*["\'][^>]*>/i', '', $content, 1);
+            $content = preg_replace('/<figure\b[^>]*>[^<]*<img[^>]+src=["\'][^"\']*' . $quotedKey . '[^"\']*["\'][^>]*>.*?<\/figure>/is', '', $content);
+            $content = preg_replace('/<img[^>]+src=["\'][^"\']*' . $quotedKey . '[^"\']*["\'][^>]*>/i', '', $content);
         }
 
         return trim($content);
@@ -128,13 +147,11 @@ class OgImageExtension extends Minz_Extension {
      * of the same photo (e.g. w_320 vs w_1200) are recognized as the same image.
      */
     private function extractImageIdentityKey(string $url): string {
-        // Kinja / Quartz / G/O Media 20-char alphanumeric image IDs
         if (preg_match('/\/([a-z0-9]{18,22})\.(?:jpg|jpeg|png|webp|gif)/i', $url, $m)) {
             return $m[1];
         }
         $path = (string)parse_url($url, PHP_URL_PATH);
         $base = basename($path);
-        // Strip common WordPress/CDN dimension suffixes like -300x200.jpg -> .jpg
         $base = preg_replace('/-\d+x\d+(?=\.[a-z]{3,4}$)/i', '', $base);
         if (!empty($base) && strlen($base) >= 8 && !in_array(strtolower($base), ['image.jpg', 'default.jpg', 'thumb.jpg', 'index.jpg'], true)) {
             return $base;
@@ -341,6 +358,10 @@ class OgImageExtension extends Minz_Extension {
         if (strpos($url, 'kinja-img.com') !== false || strpos($url, 'qz.com') !== false) {
             $url = preg_replace('/\bw_\d+\b/i', 'w_1200', $url);
             $url = preg_replace('/,?\be_blur:\d+\b/i', '', $url);
+        }
+        // Upgrade E! Online (akns-images.eonline.com) dimensions to 1200x630
+        if (strpos($url, 'eonline.com') !== false) {
+            $url = preg_replace('/\/rs_\d+x\d+-[^\/]+\//i', '/rs_1200x630-240101120000-1200-630/', $url);
         }
         return $url;
     }
