@@ -17,7 +17,7 @@ class OgImageExtension extends Minz_Extension {
 
         $content = (string)$entry->content();
 
-        // Fetch up to 512KB of the webpage HTML to capture <head>, JSON-LD VideoObjects, and player posters
+        // Fetch up to 512KB of the webpage HTML with full browser headers to bypass WAF blocks on sites like Politico
         $ch = curl_init($link);
         if ($ch === false) {
             return $entry;
@@ -26,12 +26,21 @@ class OgImageExtension extends Minz_Extension {
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_MAXREDIRS => 4,
-            CURLOPT_CONNECTTIMEOUT => 3,
+            CURLOPT_MAXREDIRS => 5,
+            CURLOPT_CONNECTTIMEOUT => 4,
             CURLOPT_TIMEOUT => 8,
             CURLOPT_SSL_VERIFYPEER => false,
             CURLOPT_ENCODING => '',
             CURLOPT_USERAGENT => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            CURLOPT_HTTPHEADER => [
+                'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'Accept-Language: en-US,en;q=0.9',
+                'Cache-Control: no-cache',
+                'Sec-Fetch-Dest: document',
+                'Sec-Fetch-Mode: navigate',
+                'Sec-Fetch-Site: none',
+                'Upgrade-Insecure-Requests: 1',
+            ],
             CURLOPT_RANGE => '0-524288',
         ]);
         $html = curl_exec($ch);
@@ -47,7 +56,7 @@ class OgImageExtension extends Minz_Extension {
             return $entry;
         }
 
-        // Upgrade thumbnail resolution parameters for known CDNs (e.g. CNBC, WordPress)
+        // Upgrade thumbnail resolution parameters for known CDNs (e.g. CNBC, Politico, WordPress)
         $heroImage = $this->optimizeImageQuality($heroImage);
 
         // Set the native FreshRSS entry thumbnail
@@ -68,6 +77,17 @@ class OgImageExtension extends Minz_Extension {
     }
 
     private function extractBestImage(string $html, string $baseUrl): string {
+        $isGalleryUrl = (bool)preg_match('#(/gallery/|/slideshow/|/photos/|[?&]slide=\d+)#i', $baseUrl);
+
+        // For explicit gallery/slide URLs (like Politico's ?slide=0), check if we can grab the exact first slide image
+        // before falling back to a potentially generic site-wide og:image banner.
+        if ($isGalleryUrl) {
+            $gallerySlideImage = $this->extractGalleryOrLeadBodyImage($html, $baseUrl);
+            if (!empty($gallerySlideImage)) {
+                return $gallerySlideImage;
+            }
+        }
+
         // 1. Check standard and video-specific <meta> tags (og:image, twitter:player:image, thumbnailUrl, etc.)
         $metaPatterns = [
             '/<meta[^>]+(?:property|name|itemprop)=["\'](?:og:image(?::secure_url|:url)?|twitter:image(?::src)?|twitter:player:image|og:video:thumbnail|thumbnailUrl)["\'][^>]+content=["\']([^"\']+)["\']/i',
@@ -86,7 +106,7 @@ class OgImageExtension extends Minz_Extension {
             }
         }
 
-        // 2. Check JSON-LD (<script type="application/ld+json">) for VideoObject.thumbnailUrl or NewsArticle.image
+        // 2. Check JSON-LD (<script type="application/ld+json">) for VideoObject, ImageGallery, or NewsArticle images
         if (preg_match_all('/<script[^>]+type=["\']application\/ld\+json["\'][^>]*>(.*?)<\/script>/is', $html, $scriptMatches)) {
             foreach ($scriptMatches[1] as $jsonRaw) {
                 $data = json_decode(trim($jsonRaw), true);
@@ -104,7 +124,7 @@ class OgImageExtension extends Minz_Extension {
             }
         }
 
-        // 3. Check embedded JSON state (e.g., Next.js / CNBC video player state) and HTML5 <video poster="...">
+        // 3. Check embedded JSON state (Next.js / video player state) and HTML5 <video poster="...">
         $fallbackPatterns = [
             '/"thumbnailUrl"\s*:\s*"([^"]+)"/i',
             '/"poster(?:Url|Image)?"\s*:\s*"([^"]+)"/i',
@@ -125,12 +145,97 @@ class OgImageExtension extends Minz_Extension {
             }
         }
 
+        // 4. Final fallback: scan <figure>, <picture>, and lead gallery/article <img> tags in the HTML body
+        return $this->extractGalleryOrLeadBodyImage($html, $baseUrl);
+    }
+
+    private function extractGalleryOrLeadBodyImage(string $html, string $baseUrl): string {
+        // Strip <header>, <nav>, <footer>, and <aside> blocks first so we don't inspect navbar/sidebar images
+        $cleanHtml = preg_replace('/<(header|nav|footer|aside)\b[^>]*>.*?<\/\1>/is', '', $html);
+        if (!is_string($cleanHtml) || empty($cleanHtml)) {
+            $cleanHtml = $html;
+        }
+
+        // Priority A: Look inside <figure> or <picture> blocks (used by Politico galleries and modern editorial sites)
+        if (preg_match_all('/<(?:figure|picture)\b[^>]*>(.*?)<\/(?:figure|picture)>/is', $cleanHtml, $figureMatches)) {
+            foreach ($figureMatches[1] as $block) {
+                $candidate = $this->extractUrlFromMediaBlock($block);
+                if (!empty($candidate)) {
+                    $resolvedUrl = null;
+                    if ($this->isValidHeroImage($candidate, $baseUrl, $resolvedUrl)) {
+                        return $resolvedUrl;
+                    }
+                }
+            }
+        }
+
+        // Priority B: Look for explicit gallery/carousel or lazy-loaded lead <img> tags
+        $imgUrl = $this->extractUrlFromMediaBlock($cleanHtml);
+        if (!empty($imgUrl)) {
+            $resolvedUrl = null;
+            if ($this->isValidHeroImage($imgUrl, $baseUrl, $resolvedUrl)) {
+                return $resolvedUrl;
+            }
+        }
+
         return '';
     }
 
+    private function extractUrlFromMediaBlock(string $block): string {
+        // 1. Check <source srcset="..."> or <img srcset="..."> and pick the largest URL in the srcset
+        if (preg_match_all('/\b(?:data-)?srcset=["\']([^"\']+)["\']/i', $block, $srcsetMatches)) {
+            foreach ($srcsetMatches[1] as $srcset) {
+                $bestFromSrcset = $this->pickBestFromSrcset($srcset);
+                if (!empty($bestFromSrcset)) {
+                    return $bestFromSrcset;
+                }
+            }
+        }
+
+        // 2. Check lazy-load and standard img attributes (data-lazy-img is used by Politico)
+        $attrPattern = '/<img[^>]+?\b(?:data-lazy-img|data-src|data-original|data-lazy-src|src)=["\']([^"\']+)["\']/i';
+        if (preg_match_all($attrPattern, $block, $imgMatches)) {
+            foreach ($imgMatches[1] as $rawUrl) {
+                $candidate = html_entity_decode(trim($rawUrl), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+                if (!empty($candidate) && strpos($candidate, 'data:') !== 0) {
+                    return $candidate;
+                }
+            }
+        }
+
+        return '';
+    }
+
+    private function pickBestFromSrcset(string $srcset): string {
+        $parts = explode(',', $srcset);
+        $bestUrl = '';
+        $maxWidth = -1;
+
+        foreach ($parts as $part) {
+            $part = trim($part);
+            if (empty($part)) {
+                continue;
+            }
+            $tokens = preg_split('/\s+/', $part);
+            $url = html_entity_decode(trim($tokens[0]), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            if (empty($url) || strpos($url, 'data:') === 0) {
+                continue;
+            }
+            $width = 0;
+            if (isset($tokens[1]) && preg_match('/^(\d+)w$/i', trim($tokens[1]), $wMatch)) {
+                $width = (int)$wMatch[1];
+            }
+            if ($width >= $maxWidth) {
+                $maxWidth = $width;
+                $bestUrl = $url;
+            }
+        }
+
+        return $bestUrl;
+    }
+
     private function collectJsonLdImages(array $node, array &$results): void {
-        // Prioritize VideoObject thumbnailUrl first, then general image/thumbnailUrl fields
-        $priorityKeys = ['thumbnailUrl', 'thumbnail', 'image'];
+        $priorityKeys = ['thumbnailUrl', 'thumbnail', 'image', 'contentUrl'];
 
         foreach ($priorityKeys as $key) {
             if (!empty($node[$key])) {
@@ -155,7 +260,6 @@ class OgImageExtension extends Minz_Extension {
             }
         }
 
-        // Recursively inspect nested objects (such as @graph, video, associatedMedia)
         foreach ($node as $k => $v) {
             if (is_array($v)) {
                 $this->collectJsonLdImages($v, $results);
@@ -168,6 +272,11 @@ class OgImageExtension extends Minz_Extension {
         if (strpos($url, 'cnbcfm.com') !== false || strpos($url, 'cnbc.com') !== false) {
             $url = preg_replace('/([?&])w=\d+/i', '$1w=1920', $url);
             $url = preg_replace('/([?&])h=\d+/i', '$1h=1080', $url);
+        }
+        // Upgrade Politico Brightspot CDN resize parameters if present
+        if (strpos($url, 'politico.com') !== false) {
+            $url = preg_replace('/\/resize\/\d+x\d+\//i', '/resize/1160x/', $url);
+            $url = preg_replace('/([?&])w=\d+/i', '$1w=1160', $url);
         }
         return $url;
     }
@@ -192,7 +301,7 @@ class OgImageExtension extends Minz_Extension {
         if (preg_match('/\.(ico|svg|mp4|m3u8|webm)(\?|$)/i', $lower)) {
             return false;
         }
-        if (preg_match('/(favicon|apple-touch-icon|avatar|author-thumb|sprite|pixel|1x1|blank\.gif|logo-icon|badge|cnbc-logo|default-promo)/i', $lower)) {
+        if (preg_match('/(favicon|apple-touch-icon|avatar|author-thumb|sprite|pixel|1x1|blank\.gif|logo-icon|badge|cnbc-logo|politico-logo|default-promo|default-social|og-default|placeholder)/i', $lower)) {
             return false;
         }
 
