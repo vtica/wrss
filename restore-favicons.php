@@ -205,9 +205,6 @@ try {
                 $savedSys['base_url'] = $sysConfig['base_url'];
             }
             $sysConfig = array_replace_recursive($sysConfig, $savedSys);
-            // Force standard FreshRSS form-based authentication.
-            $sysConfig['auth_type'] = 'form';
-            
             echo "✅ Restored System config (and persistent salt) from Aiven DB.\n";
         }
     }
