@@ -17,3 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ca-certific
 # Pre-seed system and user configurations so extensions stay enabled across rebuilds
 COPY config.custom.php /var/www/FreshRSS/data/config.custom.php
 COPY config.default.php /var/www/FreshRSS/data/users/_/config.default.php
+COPY restore-favicons.php /var/www/FreshRSS/cli/restore-favicons.php
+
+# Inject restore-favicons.php into Docker entrypoint right before Apache starts
+RUN sed -i 's|^exec "\$@"|php /var/www/FreshRSS/cli/restore-favicons.php\nexec "\$@"|' /var/www/FreshRSS/Docker/entrypoint.sh
