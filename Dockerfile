@@ -28,6 +28,4 @@ COPY config.default.php /var/www/FreshRSS/data/users/_/config.default.php
 COPY restore-favicons.php /var/www/FreshRSS/cli/restore-favicons.php
 
 # Run --restore on boot and launch --sync in the background before Apache starts
-COPY force-form-auth.php /var/www/FreshRSS/cli/force-form-auth.php
-
-RUN sed -i 's|^exec "\$@"|php /var/www/FreshRSS/cli/force-form-auth.php\nphp /var/www/FreshRSS/cli/restore-favicons.php\nexec "\$@"|' /var/www/FreshRSS/Docker/entrypoint.sh
+RUN sed -i 's|^exec "\$@"|php /var/www/FreshRSS/cli/restore-favicons.php --restore\nphp /var/www/FreshRSS/cli/restore-favicons.php --sync \&\nexec "\$@"|' /var/www/FreshRSS/Docker/entrypoint.sh
